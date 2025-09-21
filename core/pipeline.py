@@ -15,9 +15,10 @@ class MatchConfig:
 class MatchingPipeline:
     """Orchestrates the matching process using selected matcher"""
 
-    def __init__(self, cache, config):
+    def __init__(self, cache, config, app_data_dir: Path):
         self.cache = cache
         self.config = config
+        self.app_data_dir = app_data_dir
         self._mode = "correlation"
         self._language = None
         self._threshold = 0.75
@@ -39,86 +40,69 @@ class MatchingPipeline:
             self._matcher.stop()
 
     def match(self, references: List[Path], remuxes: List[Path]) -> Generator[Dict, None, None]:
-        """
-        Main matching logic with elimination strategy
-        Yields progress updates and match results
-        """
         self._running = True
-
-        # Get the appropriate matcher
         self._matcher = self._get_matcher()
         if not self._matcher:
             yield {'type': 'progress', 'message': 'Invalid matcher mode', 'value': 0}
             return
 
-        # Prepare for matching
         unmatched_remuxes = list(remuxes)
         total_refs = len(references)
 
         yield {'type': 'progress', 'message': f'Starting {self._mode} matching...', 'value': 0}
 
         for idx, ref_path in enumerate(references):
-            if not self._running:
+            if not self._running or not unmatched_remuxes:
                 break
 
-            progress = int((idx / total_refs) * 90)
+            progress = int((idx / total_refs) * 95) # Leave room for final step
             yield {
                 'type': 'progress',
                 'message': f'Processing {ref_path.name} ({idx+1}/{total_refs})',
                 'value': progress
             }
 
-            # Skip if no unmatched files left
-            if not unmatched_remuxes:
-                continue
-
-            # Find best match from remaining pool
-            best_match = None
-            best_score = 0
-            best_info = ""
+            best_match_for_ref = {'remux_path': None, 'score': 0, 'info': ''}
 
             for remux_path in unmatched_remuxes:
                 if not self._running:
                     break
 
-                # Quick pre-filter based on duration if available
                 if not self._should_compare(ref_path, remux_path):
                     continue
 
-                # Compare using selected matcher
                 score, info = self._matcher.compare(ref_path, remux_path, self._language)
 
-                if score > best_score:
-                    best_score = score
-                    best_match = remux_path
-                    best_info = info
+                if score > best_match_for_ref['score']:
+                    best_match_for_ref['score'] = score
+                    best_match_for_ref['remux_path'] = remux_path
+                    best_match_for_ref['info'] = info
 
-            # Process the best match if above threshold
-            if best_match and best_score >= self._threshold:
+            best_remux = best_match_for_ref['remux_path']
+            best_score = best_match_for_ref['score']
+
+            if best_remux and best_score >= self._threshold:
                 yield {
                     'type': 'match',
                     'data': {
-                        'remux_path': str(best_match),
+                        'remux_path': str(best_remux),
                         'reference_path': str(ref_path),
                         'confidence': best_score,
-                        'info': best_info
+                        'info': best_match_for_ref['info']
                     }
                 }
-                unmatched_remuxes.remove(best_match)
-            else:
-                # Report low confidence match but don't consume from pool
-                if best_match:
-                    yield {
-                        'type': 'match',
-                        'data': {
-                            'remux_path': str(best_match),
-                            'reference_path': str(ref_path),
-                            'confidence': best_score,
-                            'info': f"Low confidence: {best_info}"
-                        }
+                unmatched_remuxes.remove(best_remux)
+            elif best_remux:
+                yield {
+                    'type': 'match',
+                    'data': {
+                        'remux_path': str(best_remux),
+                        'reference_path': str(ref_path),
+                        'confidence': best_score,
+                        'info': f"Low confidence: {best_match_for_ref['info']}"
                     }
+                }
 
-        # Report remaining unmatched files
         for remux_path in unmatched_remuxes:
             yield {
                 'type': 'match',
@@ -126,49 +110,36 @@ class MatchingPipeline:
                     'remux_path': str(remux_path),
                     'reference_path': None,
                     'confidence': 0.0,
-                    'info': 'No match found'
+                    'info': 'No suitable match found'
                 }
             }
-
         yield {'type': 'progress', 'message': 'Matching complete', 'value': 100}
 
     def _get_matcher(self):
-        """Get the appropriate matcher instance based on mode"""
         if self._mode == "correlation":
             from matchers.audio.correlation import CorrelationMatcher
-            return CorrelationMatcher(self.cache, self.config)
-
+            return CorrelationMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "chromaprint":
             from matchers.audio.chromaprint import ChromaprintMatcher
-            return ChromaprintMatcher(self.cache, self.config)
-
+            return ChromaprintMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "mfcc":
             from matchers.audio.mfcc import MFCCMatcher
-            return MFCCMatcher(self.cache, self.config)
-
+            return MFCCMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "panako":
             from matchers.audio.panako import PanakoMatcher
-            return PanakoMatcher(self.cache, self.config)
-
+            return PanakoMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "phash":
             from matchers.video.phash import PerceptualHashMatcher
-            return PerceptualHashMatcher(self.cache, self.config)
-
+            return PerceptualHashMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "scene":
             from matchers.video.scene import SceneDetectionMatcher
-            return SceneDetectionMatcher(self.cache, self.config)
-
+            return SceneDetectionMatcher(self.cache, self.config, self.app_data_dir)
         return None
 
     def _should_compare(self, ref_path: Path, remux_path: Path) -> bool:
-        """Quick pre-filter based on file properties"""
-        # Get durations from cache
         ref_duration = self.cache.get_duration(ref_path)
         remux_duration = self.cache.get_duration(remux_path)
-
         if ref_duration and remux_duration:
-            # Skip if durations differ by more than 5 seconds
             if abs(ref_duration - remux_duration) > 5.0:
                 return False
-
         return True

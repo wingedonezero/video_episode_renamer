@@ -9,9 +9,10 @@ from typing import Tuple, Optional
 class BaseMatcher(ABC):
     """Base class for all matching implementations"""
 
-    def __init__(self, cache, config):
+    def __init__(self, cache, config, app_data_dir: Path):
         self.cache = cache
         self.config = config
+        self.app_data_dir = app_data_dir
         self._running = True
 
     def stop(self):
@@ -27,35 +28,52 @@ class BaseMatcher(ABC):
         pass
 
     def get_audio_stream_index(self, path: Path, language: Optional[str] = None) -> Optional[int]:
-        """Helper to find the right audio stream"""
+        """Helper to find the right audio stream, now with clearer logic and fallback."""
         from utils.media import get_stream_info
 
-        streams = self.cache.get_stream_info(path)
-        if streams is None:
-            streams = get_stream_info(path)
-            self.cache.set_stream_info(path, streams)
+        all_streams = self.cache.get_stream_info(path)
+        if all_streams is None:
+            all_streams = get_stream_info(path)
+            self.cache.set_stream_info(path, all_streams)
 
-        if not streams:
+        if not all_streams:
             return None
 
-        # If no language specified, return first audio stream
+        # Find all available audio streams and their absolute indices
+        audio_streams = [
+            (i, s) for i, s in enumerate(all_streams) if s.get('codec_type') == 'audio'
+        ]
+
+        if not audio_streams:
+            print(f"[DEBUG] No audio streams found in {path.name}")
+            return None
+
+        # If no language is specified, just use the first audio stream found
         if not language:
-            return 0
+            first_audio_stream_index = audio_streams[0][0]
+            print(f"[DEBUG] No language specified. Using first audio stream (absolute index: {first_audio_stream_index}) for {path.name}")
+            return first_audio_stream_index
 
-        # Find streams matching the language
+        # If language is specified, search for it
         candidates = []
-        for idx, stream in enumerate(streams):
-            stream_lang = stream.get('properties', {}).get('language', '').lower()
+        for abs_index, stream in audio_streams:
+            stream_lang = stream.get('tags', {}).get('language', '').lower()
             if stream_lang == language:
-                title = stream.get('properties', {}).get('track_name', '').lower()
-                candidates.append((idx, 'commentary' not in title))
+                title = stream.get('tags', {}).get('title', '').lower()
+                # Prefer non-commentary tracks
+                is_non_commentary = 'commentary' not in title
+                candidates.append({'index': abs_index, 'non_comm': is_non_commentary})
 
-        if not candidates:
-            return 0  # Fallback to first stream
+        # If we found matches for the language
+        if candidates:
+            # Sort to prioritize non-commentary tracks
+            candidates.sort(key=lambda x: x['non_comm'], reverse=True)
+            best_match_index = candidates[0]['index']
+            print(f"[DEBUG] Found language '{language}'. Using best match (absolute index: {best_match_index}) for {path.name}")
+            return best_match_index
 
-        # Prefer non-commentary tracks
-        non_commentary = [idx for idx, non_comm in candidates if non_comm]
-        if non_commentary:
-            return non_commentary[0]
-
-        return candidates[0][0]
+        # --- FALLBACK LOGIC ---
+        # If no streams matched the language, fall back to the first audio stream
+        first_audio_stream_index = audio_streams[0][0]
+        print(f"[DEBUG] Language '{language}' not found. FALLING BACK to first audio stream (absolute index: {first_audio_stream_index}) for {path.name}")
+        return first_audio_stream_index

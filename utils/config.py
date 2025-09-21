@@ -20,6 +20,9 @@ class Config:
             'panako_jar': '',
             'cache_size_mb': 500,
 
+            # --- NEW SETTING ---
+            'analysis_start_percent': 15,
+
             # Correlation settings
             'correlation_chunks': 10,
             'correlation_chunk_duration': 15,
@@ -27,7 +30,6 @@ class Config:
 
             # Video settings
             'video_frames': 25,
-            'video_edge_skip': 0.2,
             'video_hash_size': 16,
 
             # Audio settings
@@ -41,17 +43,14 @@ class Config:
             try:
                 with open(self.config_file, 'r') as f:
                     settings = json.load(f)
-                    # Merge with defaults
                     return {**self.defaults, **settings}
             except (json.JSONDecodeError, IOError):
                 pass
-
         return self.defaults.copy()
 
     def save(self, settings: Dict[str, Any]):
         """Save configuration to file"""
         try:
-            # Only save non-default values
             to_save = {}
             for key, value in settings.items():
                 if key in self.defaults and value != self.defaults[key]:
@@ -61,7 +60,6 @@ class Config:
 
             with open(self.config_file, 'w') as f:
                 json.dump(to_save, f, indent=2)
-
         except IOError:
             pass
 
