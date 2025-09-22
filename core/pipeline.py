@@ -48,7 +48,7 @@ class MatchingPipeline:
 
         yield {'type': 'progress', 'message': f'Starting {self._mode} matching...', 'value': 0}
 
-        audio_fingerprinters = ['chromaprint', 'peak_matcher']
+        audio_fingerprinters = ['chromaprint', 'peak_matcher', 'invariant_matcher']
         if self._mode in audio_fingerprinters:
             yield from self._run_fingerprint_batch(references, remuxes)
         else:
@@ -61,7 +61,6 @@ class MatchingPipeline:
         total_files = len(references) + len(remuxes)
         files_done = 0
 
-        # 1. Pre-processing: Generate all fingerprints
         ref_fingerprints = {}
         for ref_path in references:
             if not self._running: return
@@ -80,7 +79,6 @@ class MatchingPipeline:
             fp = self._matcher.get_fingerprint(remux_path, self._language)
             if fp: remux_fingerprints[remux_path] = fp
 
-        # 2. Comparison: Compare all fingerprints in memory
         yield {'type': 'progress', 'message': 'Comparing fingerprints...', 'value': 50}
         best_matches = {remux: {'score': -1, 'ref': None} for remux in remuxes}
         used_references = set()
@@ -155,6 +153,9 @@ class MatchingPipeline:
         elif self._mode == "peak_matcher":
             from matchers.audio.peak_matcher import PeakMatcher
             return PeakMatcher(self.cache, self.config, self.app_data_dir)
+        elif self._mode == "invariant_matcher":
+            from matchers.audio.invariant_matcher import InvariantMatcher
+            return InvariantMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "mfcc":
             from matchers.audio.mfcc import MFCCMatcher
             return MFCCMatcher(self.cache, self.config, self.app_data_dir)
