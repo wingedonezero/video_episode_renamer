@@ -154,7 +154,14 @@ class VideoEpisodeRenamer(QMainWindow):
         config_layout = QHBoxLayout()
         config_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Correlation (Audio)", "Chromaprint (Audio)", "MFCC (Audio)", "Panako (Audio)", "Perceptual Hash (Video)", "Scene Detection (Video)"])
+        self.mode_combo.addItems([
+            "Correlation (Audio)",
+            "Chromaprint (Audio)",
+            "Peak Matcher (Audio)",
+            "MFCC (Audio)",
+            "Perceptual Hash (Video)",
+            "Scene Detection (Video)"
+        ])
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         config_layout.addWidget(self.mode_combo)
         self.lang_label = QLabel("Language:")
@@ -239,6 +246,9 @@ class VideoEpisodeRenamer(QMainWindow):
         if folder: line_edit.setText(folder)
 
     def start_matching(self):
+        if self.matcher_thread and self.matcher_thread.isRunning():
+            return
+
         if not self.ref_folder.text() or not self.remux_folder.text():
             QMessageBox.warning(self, "Error", "Please select both folders"); return
 
@@ -249,15 +259,20 @@ class VideoEpisodeRenamer(QMainWindow):
             QMessageBox.warning(self, "Error", "No video files found in one or both of the selected folders.")
             return
 
-        # --- MODIFICATION: Provide immediate UI feedback ---
         self.status_label.setText(f"Starting {self.mode_combo.currentText()}...")
         self.progress.setValue(0)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.rename_btn.setEnabled(False)
-        # --- END MODIFICATION ---
 
-        mode_map = {"Correlation (Audio)": "correlation", "Chromaprint (Audio)": "chromaprint", "MFCC (Audio)": "mfcc", "Panako (Audio)": "panako", "Perceptual Hash (Video)": "phash", "Scene Detection (Video)": "scene"}
+        mode_map = {
+            "Correlation (Audio)": "correlation",
+            "Chromaprint (Audio)": "chromaprint",
+            "Peak Matcher (Audio)": "peak_matcher",
+            "MFCC (Audio)": "mfcc",
+            "Perceptual Hash (Video)": "phash",
+            "Scene Detection (Video)": "scene"
+        }
         mode = mode_map[self.mode_combo.currentText()]
         self.pipeline.set_mode(mode)
         self.pipeline.set_language(self.lang_input.text() or None)
@@ -286,33 +301,54 @@ class VideoEpisodeRenamer(QMainWindow):
         self.match_results.append(match_data)
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
-        orig_item = QTableWidgetItem(Path(match_data['remux_path']).name)
+
+        if match_data.get('remux_path'):
+            orig_item = QTableWidgetItem(Path(match_data['remux_path']).name)
+            if match_data.get('reference_path'):
+                proposed = QTableWidgetItem(Path(match_data['reference_path']).name)
+            else:
+                proposed = QTableWidgetItem("")
+        else:
+            orig_item = QTableWidgetItem("---")
+            proposed = QTableWidgetItem(Path(match_data['reference_path']).name)
+
         self.results_table.setItem(row, 0, orig_item)
-        if match_data.get('reference_path'): proposed = QTableWidgetItem(Path(match_data['reference_path']).name)
-        else: proposed = QTableWidgetItem("")
         self.results_table.setItem(row, 1, proposed)
+
         conf = match_data.get('confidence', 0)
         conf_item = QTableWidgetItem(f"{conf:.1%}")
         self.results_table.setItem(row, 2, conf_item)
+
         info_item = QTableWidgetItem(match_data.get('info', ''))
         self.results_table.setItem(row, 3, info_item)
+
         threshold = self.confidence_slider.value() / 100.0
-        if match_data.get('reference_path') and conf >= threshold:
+        status_text = match_data.get('status', '')
+
+        if status_text == 'Unused':
+            status = "Unused"
+            color = QColor(220, 220, 220)
+        elif match_data.get('reference_path') and conf >= threshold:
             status = "Matched"
-            if conf > 0.95: color = QColor(144, 238, 144)
-            else: color = QColor(255, 255, 150)
+            color = QColor(144, 238, 144)
         elif match_data.get('reference_path'):
-            status = "Low Confidence"; color = QColor(255, 200, 150)
+            status = "Low Confidence"
+            color = QColor(255, 200, 150)
         else:
-            status = "Unmatched"; color = QColor(255, 182, 193)
+            status = "Unmatched"
+            color = QColor(255, 182, 193)
+
         status_item = QTableWidgetItem(status)
         self.results_table.setItem(row, 4, status_item)
+
         for col in range(5):
             item = self.results_table.item(row, col)
             if item:
                 item.setBackground(color)
                 item.setForeground(QColor(0, 0, 0))
-        if status == "Matched": self.rename_btn.setEnabled(True)
+
+        if status == "Matched":
+            self.rename_btn.setEnabled(True)
 
     def matching_finished(self):
         self.start_btn.setEnabled(True)
@@ -324,26 +360,35 @@ class VideoEpisodeRenamer(QMainWindow):
         threshold = self.confidence_slider.value() / 100.0
         rename_list = []
         for match in self.match_results:
-            if match.get('reference_path') and match.get('confidence', 0) >= threshold:
-                orig = Path(match['remux_path']); ref = Path(match['reference_path'])
-                new_name = ref.stem + orig.suffix; new_path = orig.parent / new_name
+            if match.get('remux_path') and match.get('reference_path') and match.get('confidence', 0) >= threshold:
+                orig = Path(match['remux_path'])
+                ref = Path(match['reference_path'])
+                new_name = ref.stem + orig.suffix
+                new_path = orig.parent / new_name
                 rename_list.append((orig, new_path))
-        if not rename_list: QMessageBox.information(self, "Info", "No files to rename"); return
+        if not rename_list:
+            QMessageBox.information(self, "Info", "No files to rename"); return
         msg = f"Rename {len(rename_list)} files?\n\nExamples:\n"
-        for orig, new in rename_list[:3]: msg += f"{orig.name} → {new.name}\n"
-        if len(rename_list) > 3: msg += f"... and {len(rename_list) - 3} more"
+        for orig, new in rename_list[:3]:
+            msg += f"{orig.name} → {new.name}\n"
+        if len(rename_list) > 3:
+            msg += f"... and {len(rename_list) - 3} more"
         reply = QMessageBox.question(self, "Confirm Rename", msg)
         if reply != QMessageBox.StandardButton.Yes: return
         success, errors = 0, []
         for orig, new in rename_list:
             try:
-                if new.exists(): errors.append(f"{new.name} already exists"); continue
-                orig.rename(new); success += 1
+                if new.exists():
+                    errors.append(f"{new.name} already exists"); continue
+                orig.rename(new)
+                success += 1
                 for row in range(self.results_table.rowCount()):
-                    if self.results_table.item(row, 0).text() == orig.name:
+                    if self.results_table.item(row, 0) and self.results_table.item(row, 0).text() == orig.name:
                         self.results_table.item(row, 0).setText(new.name)
-                        self.results_table.item(row, 4).setText("Renamed"); break
-            except Exception as e: errors.append(f"{orig.name}: {str(e)}")
+                        self.results_table.item(row, 4).setText("Renamed")
+                        break
+            except Exception as e:
+                errors.append(f"{orig.name}: {str(e)}")
         msg = f"Successfully renamed {success} files"
         if errors:
             msg += f"\n\nErrors:\n" + "\n".join(errors[:5])

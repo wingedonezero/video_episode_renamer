@@ -46,74 +46,104 @@ class MatchingPipeline:
             yield {'type': 'progress', 'message': 'Invalid matcher mode', 'value': 0}
             return
 
-        unmatched_remuxes = list(remuxes)
-        total_refs = len(references)
-
         yield {'type': 'progress', 'message': f'Starting {self._mode} matching...', 'value': 0}
 
-        for idx, ref_path in enumerate(references):
-            if not self._running or not unmatched_remuxes:
-                break
+        audio_fingerprinters = ['chromaprint', 'peak_matcher']
+        if self._mode in audio_fingerprinters:
+            yield from self._run_fingerprint_batch(references, remuxes)
+        else:
+            yield from self._run_exhaustive_compare(references, remuxes)
 
-            progress = int((idx / total_refs) * 95) # Leave room for final step
-            yield {
-                'type': 'progress',
-                'message': f'Processing {ref_path.name} ({idx+1}/{total_refs})',
-                'value': progress
-            }
+        yield {'type': 'progress', 'message': 'Matching complete', 'value': 100}
 
-            best_match_for_ref = {'remux_path': None, 'score': 0, 'info': ''}
+    def _run_fingerprint_batch(self, references: List[Path], remuxes: List[Path]):
+        """Runs a fast, two-step process for fingerprinting matchers."""
+        total_files = len(references) + len(remuxes)
+        files_done = 0
 
-            for remux_path in unmatched_remuxes:
-                if not self._running:
-                    break
+        # 1. Pre-processing: Generate all fingerprints
+        ref_fingerprints = {}
+        for ref_path in references:
+            if not self._running: return
+            files_done += 1
+            progress = int((files_done / total_files) * 50) if total_files > 0 else 0
+            yield {'type': 'progress', 'message': f'Analyzing ref: {ref_path.name}', 'value': progress}
+            fp = self._matcher.get_fingerprint(ref_path, self._language)
+            if fp: ref_fingerprints[ref_path] = fp
 
-                if not self._should_compare(ref_path, remux_path):
-                    continue
+        remux_fingerprints = {}
+        for remux_path in remuxes:
+            if not self._running: return
+            files_done += 1
+            progress = int((files_done / total_files) * 50) if total_files > 0 else 0
+            yield {'type': 'progress', 'message': f'Analyzing remux: {remux_path.name}', 'value': progress}
+            fp = self._matcher.get_fingerprint(remux_path, self._language)
+            if fp: remux_fingerprints[remux_path] = fp
+
+        # 2. Comparison: Compare all fingerprints in memory
+        yield {'type': 'progress', 'message': 'Comparing fingerprints...', 'value': 50}
+        best_matches = {remux: {'score': -1, 'ref': None} for remux in remuxes}
+        used_references = set()
+
+        for remux_path, remux_fp in remux_fingerprints.items():
+            for ref_path, ref_fp in ref_fingerprints.items():
+                if not self._running: return
+                score = self._matcher.compare_fingerprints(ref_fp, remux_fp)
+                if score > best_matches[remux_path]['score']:
+                    best_matches[remux_path] = {'score': score, 'ref': ref_path}
+
+        for remux_path, match_info in best_matches.items():
+            best_ref = match_info['ref']
+            best_score = match_info['score']
+            if best_ref and best_score >= self._threshold:
+                used_references.add(best_ref)
+
+            info = f"{self._mode.replace('_', ' ').capitalize()} similarity: {best_score:.1%}" if best_score >= 0 else "Fingerprint failed"
+            yield {'type': 'match', 'data': {'remux_path': str(remux_path), 'reference_path': str(best_ref) if best_ref else None, 'confidence': best_score, 'info': info}}
+
+        for ref_path in references:
+            if ref_path not in used_references:
+                yield {'type': 'match', 'data': {'remux_path': None, 'reference_path': str(ref_path), 'confidence': 0.0, 'info': 'Reference file not used', 'status': 'Unused'}}
+
+    def _run_exhaustive_compare(self, references: List[Path], remuxes: List[Path]):
+        """Original exhaustive comparison for non-fingerprinting modes."""
+        best_matches = {remux: {'score': -1, 'ref': None, 'info': ''} for remux in remuxes}
+        used_references = set()
+        total_comparisons = len(references) * len(remuxes)
+        comparisons_done = 0
+
+        for ref_path in references:
+            if not self._running: break
+            for remux_path in remuxes:
+                if not self._running: break
+
+                comparisons_done += 1
+                progress = int((comparisons_done / total_comparisons) * 100) if total_comparisons > 0 else 0
+                yield {'type': 'progress', 'message': f'Comparing {ref_path.name} to {remux_path.name}', 'value': progress}
+
+                if not self._should_compare(ref_path, remux_path): continue
 
                 score, info = self._matcher.compare(ref_path, remux_path, self._language)
 
-                if score > best_match_for_ref['score']:
-                    best_match_for_ref['score'] = score
-                    best_match_for_ref['remux_path'] = remux_path
-                    best_match_for_ref['info'] = info
+                if score > best_matches[remux_path]['score']:
+                    best_matches[remux_path] = {'score': score, 'ref': ref_path, 'info': info}
 
-            best_remux = best_match_for_ref['remux_path']
-            best_score = best_match_for_ref['score']
+        if self._running:
+            for remux_path, match_info in best_matches.items():
+                best_ref = match_info['ref']
+                best_score = match_info['score']
 
-            if best_remux and best_score >= self._threshold:
-                yield {
-                    'type': 'match',
-                    'data': {
-                        'remux_path': str(best_remux),
-                        'reference_path': str(ref_path),
-                        'confidence': best_score,
-                        'info': best_match_for_ref['info']
-                    }
-                }
-                unmatched_remuxes.remove(best_remux)
-            elif best_remux:
-                yield {
-                    'type': 'match',
-                    'data': {
-                        'remux_path': str(best_remux),
-                        'reference_path': str(ref_path),
-                        'confidence': best_score,
-                        'info': f"Low confidence: {best_match_for_ref['info']}"
-                    }
-                }
+                if best_ref and best_score >= self._threshold:
+                    used_references.add(best_ref)
 
-        for remux_path in unmatched_remuxes:
-            yield {
-                'type': 'match',
-                'data': {
-                    'remux_path': str(remux_path),
-                    'reference_path': None,
-                    'confidence': 0.0,
-                    'info': 'No suitable match found'
-                }
-            }
-        yield {'type': 'progress', 'message': 'Matching complete', 'value': 100}
+                if best_ref and best_score >= 0:
+                    yield {'type': 'match', 'data': {'remux_path': str(remux_path), 'reference_path': str(best_ref), 'confidence': best_score, 'info': match_info['info']}}
+                else:
+                    yield {'type': 'match', 'data': {'remux_path': str(remux_path), 'reference_path': None, 'confidence': 0.0, 'info': 'No suitable match found'}}
+
+            for ref_path in references:
+                if ref_path not in used_references:
+                    yield {'type': 'match', 'data': {'remux_path': None, 'reference_path': str(ref_path), 'confidence': 0.0, 'info': 'Reference file not used', 'status': 'Unused'}}
 
     def _get_matcher(self):
         if self._mode == "correlation":
@@ -122,12 +152,12 @@ class MatchingPipeline:
         elif self._mode == "chromaprint":
             from matchers.audio.chromaprint import ChromaprintMatcher
             return ChromaprintMatcher(self.cache, self.config, self.app_data_dir)
+        elif self._mode == "peak_matcher":
+            from matchers.audio.peak_matcher import PeakMatcher
+            return PeakMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "mfcc":
             from matchers.audio.mfcc import MFCCMatcher
             return MFCCMatcher(self.cache, self.config, self.app_data_dir)
-        elif self._mode == "panako":
-            from matchers.audio.panako import PanakoMatcher
-            return PanakoMatcher(self.cache, self.config, self.app_data_dir)
         elif self._mode == "phash":
             from matchers.video.phash import PerceptualHashMatcher
             return PerceptualHashMatcher(self.cache, self.config, self.app_data_dir)

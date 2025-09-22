@@ -5,7 +5,7 @@
 import subprocess
 import json
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any
 from core.matcher import BaseMatcher
 from utils.media import get_media_duration
 
@@ -16,24 +16,20 @@ class ChromaprintMatcher(BaseMatcher):
         super().__init__(cache, config, app_data_dir)
 
     def compare(self, ref_path: Path, remux_path: Path, language: Optional[str] = None) -> Tuple[float, str]:
-        ref_fp = self._get_fingerprint(ref_path, language)
-        remux_fp = self._get_fingerprint(remux_path, language)
-
+        ref_fp = self.get_fingerprint(ref_path, language)
+        remux_fp = self.get_fingerprint(remux_path, language)
         if not ref_fp or not remux_fp:
-            return 0.0, "Failed to generate fingerprint"
+            return -1.0, "Failed to generate fingerprint"
+        score = self.compare_fingerprints(ref_fp, remux_fp)
+        return score, f"Chromaprint similarity: {score:.1%}"
 
-        similarity = self._compare_fingerprints(ref_fp, remux_fp)
-        info = f"Chromaprint similarity"
-        return similarity, info
-
-    def _get_fingerprint(self, path: Path, language: Optional[str]) -> Optional[str]:
+    def get_fingerprint(self, path: Path, language: Optional[str] = None) -> Optional[Any]:
+        """Public method to generate or retrieve a single fingerprint."""
         stream_idx = self.get_audio_stream_index(path, language)
-        if stream_idx is None:
-            return None
+        if stream_idx is None: return None
 
         cached = self.cache.get_chromaprint(path, stream_idx)
-        if cached:
-            return cached
+        if cached: return cached
 
         duration = get_media_duration(path)
         analysis_duration_s = 120
@@ -46,24 +42,15 @@ class ChromaprintMatcher(BaseMatcher):
 
         try:
             audio_rate, audio_channels, audio_format = '16000', '1', 's16le'
-
             ffmpeg_cmd = [
-                'ffmpeg', '-nostdin', '-v', 'error',
-                *seek_args,
-                '-i', str(path),
-                '-t', str(analysis_duration_s),
-                # --- CORRECTION: Use absolute stream index ---
-                '-map', f'0:{stream_idx}',
-                '-ac', audio_channels,
-                '-ar', audio_rate,
-                '-f', audio_format,
-                '-'
+                'ffmpeg', '-nostdin', '-v', 'error', *seek_args, '-i', str(path),
+                '-t', str(analysis_duration_s), '-map', f'0:{stream_idx}',
+                '-ac', audio_channels, '-ar', audio_rate, '-f', audio_format, '-'
             ]
             fpcalc_cmd = [
                 'fpcalc', '-raw', '-json', '-rate', audio_rate,
                 '-channels', audio_channels, '-format', audio_format, '-'
             ]
-
             p_ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE)
             p_fpcalc = subprocess.Popen(fpcalc_cmd, stdin=p_ffmpeg.stdout, stdout=subprocess.PIPE, text=True)
             p_ffmpeg.stdout.close()
@@ -81,7 +68,9 @@ class ChromaprintMatcher(BaseMatcher):
             pass
         return None
 
-    def _compare_fingerprints(self, fp1: str, fp2: str) -> float:
+    def compare_fingerprints(self, fp1: Any, fp2: Any) -> float:
+        """Compares two pre-computed fingerprints."""
+        if not isinstance(fp1, str) or not isinstance(fp2, str): return 0.0
         arr1 = [int(x) for x in fp1.split(',')]
         arr2 = [int(x) for x in fp2.split(',')]
         min_len = min(len(arr1), len(arr2))
